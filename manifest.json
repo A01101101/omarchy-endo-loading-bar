@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "endo-loading-bar",
+  "name": "Endo Loading Bar",
+  "version": "1.0.0",
+  "author": "a01101101",
+  "license": "MIT",
+  "description": "A hairline loading bar flush to the bottom of every screen, with slow hypnotic light waves and a colour scheme for each Omarchy theme. Drive it from the shell with IPC or wrap any download with endo-bar.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Main.qml"
+  },
+  "repository": "https://github.com/A01101101/omarchy-endo-loading-bar"
+}

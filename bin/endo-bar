@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""endo-bar: run a command and show its real progress on the Endo Loading Bar.
+
+  endo-bar "curl -# -L -O https://example.com/file.zip"
+  endo-bar "wget https://example.com/file.zip"
+  endo-bar "your-command" --watch out.bin --total 734003200
+
+The command runs on a pseudo-terminal so tools print their progress meter. The
+percentage found in its output is sent to the plugin with
+`omarchy-shell endo-loading-bar set N`. When the command exits successfully the bar
+fills, holds and fades; on failure it hides. The exit code is passed through.
+"""
+import argparse
+import os
+import pty
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+TARGET = "endo-loading-bar"
+PERCENT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+CURL_ROW_RE = re.compile(r"^\s*(\d{1,3})\s+\d+(?:\.\d+)?[kKMGTP]?\s+\d{1,3}\s")
+
+
+def parse_percent(text):
+    """Most recent percentage (0..100) in terminal output, or None."""
+    for line in reversed(re.split(r"[\r\n]+", text)):
+        m = PERCENT_RE.findall(line)
+        if m and 0 <= float(m[-1]) <= 100:
+            return float(m[-1])
+        m = CURL_ROW_RE.match(line)
+        if m and 0 <= int(m.group(1)) <= 100:
+            return float(m.group(1))
+    return None
+
+
+def shell_call(*args):
+    env = dict(os.environ)
+    env.setdefault("OMARCHY_PATH", "/usr/share/omarchy")
+    return subprocess.run(["omarchy-shell", "-q", TARGET, *args], env=env,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", help="shell command to run (quote it)")
+    ap.add_argument("--watch", metavar="FILE", help="also track this file's size (needs --total)")
+    ap.add_argument("--total", type=int, metavar="BYTES", help="expected final size of --watch FILE")
+    args = ap.parse_args()
+    if args.watch and not args.total:
+        ap.error("--watch needs --total")
+
+    master, slave = pty.openpty()
+    proc = subprocess.Popen(args.command, shell=True, stdin=subprocess.DEVNULL, stdout=slave,
+                            stderr=slave, close_fds=True, start_new_session=True)
+    os.close(slave)
+
+    state = {"percent": 0.0, "done": False}
+
+    def reader():
+        buf = ""
+        while True:
+            try:
+                data = os.read(master, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+            buf = (buf + data.decode("utf-8", "replace"))[-600:]
+            v = parse_percent(buf)
+            if v is not None:
+                state["percent"] = v
+        state["done"] = True
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
+    def stop(*_):
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        shell_call("hide")
+        sys.exit(130)
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    last = -1.0
+    while proc.poll() is None:
+        v = state["percent"]
+        if args.watch:
+            try:
+                v = max(v, 100.0 * os.path.getsize(args.watch) / args.total)
+            except OSError:
+                pass
+        v = min(v, 99.9)
+        if abs(v - last) >= 0.2:          # only call out when it moved
+            shell_call("set", f"{v:.1f}")
+            last = v
+        time.sleep(0.25)
+
+    t.join(timeout=1)
+    code = proc.returncode
+    shell_call("done" if code == 0 else "hide")
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
