@@ -64,6 +64,29 @@ ln -s ~/.config/omarchy/plugins/endo-loading-bar/bin/endo-bar ~/.local/bin/endo-
 - Multi-file jobs (several packages in a row) will stall and jump, because each file
   restarts at 0%. Progress never moves backwards.
 
+### Show every terminal download automatically
+
+`bin/endo-watch` runs in the background and puts any `curl` or `wget` download on the bar
+without wrapping it. Install it as a user service:
+
+```bash
+ln -s ~/.config/omarchy/plugins/endo-loading-bar/systemd/endo-watch.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now endo-watch.service
+```
+
+- Once a second it finds your `curl`/`wget` processes that are writing to a file, asks the
+  server for the file's size once (a `HEAD` request, or a one-byte ranged `GET`), and fills
+  the bar from how much of the file is on disk. Several downloads show as one combined bar.
+- A finished download fills and fades. One that stops early hides the bar.
+- It ignores files under 5 MiB (`--min-size`), output to a pipe or the terminal (API calls,
+  `curl | sh`), and anything `endo-bar` is already driving.
+- It needs the size from the server: downloads that send auth headers or cookies, or
+  servers that report no size, are skipped. `aria2c` and `yt-dlp` aren't tracked; wrap
+  them with `endo-bar`.
+- `bin/endo-watch --once` prints what it would track. Logs: `journalctl --user -u endo-watch`.
+- Tests: `python3 tools/test_endo_watch.py`.
+
 ## How it looks
 
 - A gradient from tail to body to a softly glowing tip, with a faint ripple flowing through it

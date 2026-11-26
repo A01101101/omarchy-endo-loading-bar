@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""endo-watch: show terminal downloads on the Endo Loading Bar automatically.
+
+Runs in the background (see systemd/endo-watch.service). Once a second it looks for
+your curl and wget processes that are writing to a file, asks the server for that
+file's full size once, and drives the bar from how much of the file is on disk.
+Several downloads at once are shown as one combined bar.
+
+It stays out of the way when `endo-bar` is already driving the bar, ignores
+downloads to a pipe or the terminal (API calls, `curl | sh`), and skips files
+smaller than --min-size so quick fetches don't flash the bar.
+
+  endo-watch                 run in the foreground
+  endo-watch --once          print what it would track and exit
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+TARGET = "endo-loading-bar"
+TOOLS = {"curl", "wget"}
+URL_RE = re.compile(r"^(https?|ftp)://", re.I)
+SKIP_PREFIXES = ("/dev/", "/proc/", "/sys/", "/run/")
+
+
+def shell_call(*args):
+    env = dict(os.environ)
+    env.setdefault("OMARCHY_PATH", "/usr/share/omarchy")
+    subprocess.run(["omarchy-shell", "-q", TARGET, *args], env=env,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def read(path, binary=False):
+    try:
+        with open(path, "rb" if binary else "r") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def download_procs(uid=None):
+    """(pid, tool, argv) for this user's curl/wget processes."""
+    uid = os.getuid() if uid is None else uid
+    out = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        comm = (read(f"/proc/{pid}/comm") or "").strip()
+        if comm not in TOOLS:
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+        except OSError:
+            continue
+        raw = read(f"/proc/{pid}/cmdline", binary=True)
+        if raw:
+            out.append((int(pid), comm, [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]))
+    return out
+
+
+def wrapper_running():
+    """True when bin/endo-bar is driving the bar itself."""
+    for pid in os.listdir("/proc"):
+        if pid.isdigit():
+            raw = read(f"/proc/{pid}/cmdline", binary=True) or b""
+            if b"endo-bar\0" in raw or raw.endswith(b"endo-bar"):
+                if b"endo-watch" not in raw:
+                    return True
+    return False
+
+
+def is_write_flags(flags_octal):
+    return (int(flags_octal, 8) & 3) in (1, 2)   # O_WRONLY or O_RDWR
+
+
+def choose_outputs(opened):
+    """Pick download targets from [(fd, path)] of files open for writing.
+
+    stderr (fd 2) is only ever a log. stdout (fd 1) is the download only for
+    `curl URL > file`; when the tool writes its own file (-o, -O, wget's default)
+    a file on stdout is just a log too.
+    """
+    own = [p for fd, p in opened if fd > 2]
+    picked = own or [p for fd, p in opened if fd == 1]
+    return list(dict.fromkeys(picked))
+
+
+def written_files(pid):
+    """Files the process is downloading into."""
+    opened = []
+    try:
+        fds = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return []
+    for fd in fds:
+        try:
+            target = os.readlink(f"/proc/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if not target.startswith("/") or target.startswith(SKIP_PREFIXES) or target.endswith(" (deleted)"):
+            continue
+        info = read(f"/proc/{pid}/fdinfo/{fd}") or ""
+        m = re.search(r"^flags:\s*(\d+)", info, re.M)
+        if m and is_write_flags(m.group(1)) and os.path.isfile(target):
+            opened.append((int(fd), target))
+    return choose_outputs(opened)
+
+
+def urls_in(argv):
+    return [a for a in argv[1:] if URL_RE.match(a)]
+
+
+def pick_url(urls, path):
+    """The URL a file came from: the only one, or the one ending in its name."""
+    if len(urls) == 1:
+        return urls[0]
+    name = os.path.basename(path)
+    for u in urls:
+        if os.path.basename(u.split("?", 1)[0].rstrip("/")) == name:
+            return u
+    return None
+
+
+def parse_total(headers):
+    """Full size from a Content-Range (ranged GET) or Content-Length header."""
+    cr = headers.get("Content-Range")
+    if cr:
+        m = re.search(r"/(\d+)\s*$", cr)
+        if m:
+            return int(m.group(1))
+    cl = headers.get("Content-Length")
+    return int(cl) if cl and cl.isdigit() else None
+
+
+def remote_size(url, timeout=8):
+    """Ask the server for the file size: HEAD first, then a one-byte ranged GET."""
+    hdrs = {"User-Agent": "endo-watch/1.0"}
+    for method, extra in (("HEAD", {}), ("GET", {"Range": "bytes=0-0"})):
+        try:
+            req = urllib.request.Request(url, method=method, headers={**hdrs, **extra})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if method == "GET" and r.status != 206:
+                    continue        # server ignored the range; don't download the file
+                size = parse_total(r.headers)
+                if size:
+                    return size
+        except (urllib.error.URLError, ValueError, OSError):
+            continue
+    return None
+
+
+class Watcher:
+    def __init__(self, min_size):
+        self.min_size = min_size
+        self.totals = {}        # (pid, path) -> total bytes, or None if unknown
+        self.last = {}          # (pid, path) -> (done_bytes, total) at last sight
+        self.shown = False
+        self.sent = -1.0
+
+    def scan(self):
+        """{(pid, path): (bytes_on_disk, total)} for downloads with a known size."""
+        live = {}
+        for pid, tool, argv in download_procs():
+            urls = urls_in(argv)
+            if not urls:
+                continue
+            for path in written_files(pid):
+                key = (pid, path)
+                if key not in self.totals:
+                    url = pick_url(urls, path)
+                    self.totals[key] = remote_size(url) if url else None
+                total = self.totals[key]
+                if not total or total < self.min_size:
+                    continue
+                try:
+                    live[key] = (os.path.getsize(path), total)
+                except OSError:
+                    pass
+        return live
+
+    def tick(self):
+        if wrapper_running():
+            self.last.clear()
+            self.shown = False
+            return
+        live = self.scan()
+        finished = [k for k in self.last if k not in live]
+        if live:
+            done = sum(min(b, t) for b, t in live.values())
+            total = sum(t for _, t in live.values())
+            pct = min(99.9, 100.0 * done / total)
+            if abs(pct - self.sent) >= 0.2 or not self.shown:
+                shell_call("set", f"{pct:.1f}")
+                self.sent = pct
+            self.shown = True
+        elif self.shown:
+            # Every tracked download has ended: fill if they all completed.
+            ok = all(self._completed(k) for k in finished)
+            shell_call("done" if ok else "hide")
+            names = ", ".join(os.path.basename(k[1]) for k in finished)
+            print(f"endo-watch: {'finished' if ok else 'stopped early'}: {names}", flush=True)
+            self.shown = False
+            self.sent = -1.0
+        for k in finished:
+            self.last.pop(k, None)
+            self.totals.pop(k, None)
+        self.last.update(live)
+        for k in [k for k in self.totals if not os.path.exists(f"/proc/{k[0]}")]:
+            self.totals.pop(k, None)
+
+    def _completed(self, key):
+        _, total = self.last[key]
+        try:
+            return os.path.getsize(key[1]) >= total
+        except OSError:
+            return False
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--interval", type=float, default=1.0, help="seconds between scans (default 1)")
+    ap.add_argument("--min-size", type=int, default=5 * 1024 * 1024,
+                    help="ignore downloads smaller than this many bytes (default 5 MiB)")
+    ap.add_argument("--once", action="store_true", help="print tracked downloads and exit")
+    args = ap.parse_args()
+
+    w = Watcher(args.min_size)
+    if args.once:
+        for (pid, path), (b, t) in w.scan().items():
+            print(f"{pid}\t{100.0 * b / t:5.1f}%\t{path}")
+        return 0
+    while True:
+        try:
+            w.tick()
+        except Exception as e:              # keep the service alive on odd /proc races
+            print(f"endo-watch: {e}", file=sys.stderr, flush=True)
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,13 @@
+[Unit]
+Description=Endo Loading Bar: show terminal downloads automatically
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.config/omarchy/plugins/endo-loading-bar/bin/endo-watch
+Environment=OMARCHY_PATH=/usr/share/omarchy
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
